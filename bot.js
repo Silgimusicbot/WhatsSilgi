@@ -1,9 +1,5 @@
-/* Copyright (C) 2020 Yusuf Usta.
-
-Licensed under the  GPL-3.0 License;
-you may not use this file except in compliance with the License.
-
-WhatsAsena - Yusuf Usta
+/* WhatsAsena - Yusuf Usta
+   Güncel: Heroku + Baileys v4+ uyumlu, session hatasına karşı güvenli
 */
 
 const fs = require("fs");
@@ -11,8 +7,8 @@ const path = require("path");
 const events = require("./events");
 const chalk = require('chalk');
 const config = require('./config');
-const {WAConnection, MessageType, Mimetype, Presence} = require('@adiwajshing/baileys');
-const {Message, StringSession, Image, Video} = require('./whatsasena/');
+const { default: makeWASocket, useSingleFileAuthState, DisconnectReason, fetchLatestBaileysVersion, MessageType, Mimetype, Presence } = require('@adiwajshing/baileys');
+const { Message, StringSession, Image, Video } = require('./whatsasena/');
 const { DataTypes } = require('sequelize');
 const { GreetingsDB, getMessage } = require("./plugins/sql/greetings");
 const got = require('got');
@@ -37,7 +33,7 @@ fs.readdirSync('./plugins/sql/').forEach(plugin => {
 
 const plugindb = require('./plugins/sql/plugin');
 
-// Yalnızca bir kolaylık. https://stackoverflow.com/questions/4974238/javascript-equivalent-of-pythons-format-function //
+// String format fonksiyonu
 String.prototype.format = function () {
     var i = 0, args = arguments;
     return this.replace(/{}/g, function () {
@@ -45,10 +41,7 @@ String.prototype.format = function () {
     });
 };
 
-if (!Date.now) {
-    Date.now = function() { return new Date().getTime(); }
-}
-
+// Array remove fonksiyonu
 Array.prototype.remove = function() {
     var what, a = arguments, L = a.length, ax;
     while (L && this.length) {
@@ -62,201 +55,133 @@ Array.prototype.remove = function() {
 
 async function whatsAsena () {
     await config.DATABASE.sync();
-    var StrSes_Db = await WhatsAsenaDB.findAll({
-        where: {
-          info: 'StringSession'
-        }
-    });
-    
-    const conn = new WAConnection();
+
+    var StrSes_Db = await WhatsAsenaDB.findAll({ where: { info: 'StringSession' } });
     const Session = new StringSession();
+    let authInfo;
 
-    conn.logger.level = config.DEBUG ? 'debug' : 'warn';
-    var nodb;
+    // Session yükleme
+    try {
+        if (StrSes_Db.length < 1) {
+            authInfo = Session.deCrypt(config.SESSION);
+        } else {
+            authInfo = Session.deCrypt(StrSes_Db[0].dataValues.value);
+        }
 
-    if (StrSes_Db.length < 1) {
-        nodb = true;
-        conn.loadAuthInfo(Session.deCrypt(config.SESSION)); 
-    } else {
-        conn.loadAuthInfo(Session.deCrypt(StrSes_Db[0].dataValues.value));
+        if (!authInfo || !authInfo.WABrowserId) {
+            console.log(chalk.red.bold('❌ Geçerli bir StringSession bulunamadı!'));
+            return;
+        }
+    } catch (err) {
+        console.log(chalk.red.bold('❌ StringSession yüklenirken hata oluştu!'), err);
+        return;
     }
 
-    conn.on ('credentials-updated', async () => {
-        console.log(
-            chalk.blueBright.italic('✅ Login information updated!')
-        );
+    // WhatsApp Bağlantısı
+    const { state, saveState } = useSingleFileAuthState('./auth_info.json'); // session backup
+    const { version } = await fetchLatestBaileysVersion();
+    const conn = makeWASocket({
+        printQRInTerminal: true,
+        auth: state,
+        version
+    });
 
-        const authInfo = conn.base64EncodedAuthInfo();
-        if (StrSes_Db.length < 1) {
-            await WhatsAsenaDB.create({ info: "StringSession", value: Session.createStringSession(authInfo) });
-        } else {
-            await StrSes_Db[0].update({ value: Session.createStringSession(authInfo) });
+    conn.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect } = update;
+        if (connection === 'open') {
+            console.log(chalk.green.bold('✅ Login successful!'));
+        } else if (connection === 'close') {
+            const reason = lastDisconnect.error?.output?.statusCode;
+            console.log(chalk.red.bold(`❌ Bağlantı kapandı: ${reason}`));
         }
-    })    
-
-    conn.on('connecting', async () => {
-        console.log(`${chalk.green.bold('Whats')}${chalk.blue.bold('Asena')}
-${chalk.white.bold('Version:')} ${chalk.red.bold(config.VERSION)}
-
-${chalk.blue.italic('ℹ️ Connecting to WhatsApp... Please wait.')}`);
     });
-    
 
-    conn.on('open', async () => {
-        console.log(
-            chalk.green.bold('✅ Login successful!')
-        );
+    conn.ev.on('creds.update', saveState);
 
-        console.log(
-            chalk.blueBright.italic('⬇️ Installing external plugins...')
-        );
-
-        var plugins = await plugindb.PluginDB.findAll();
-        plugins.map(async (plugin) => {
-            if (!fs.existsSync('./plugins/' + plugin.dataValues.name + '.js')) {
-                console.log(plugin.dataValues.name);
-                var response = await got(plugin.dataValues.url);
-                if (response.statusCode == 200) {
-                    fs.writeFileSync('./plugins/' + plugin.dataValues.name + '.js', response.body);
-                    require('./plugins/' + plugin.dataValues.name + '.js');
-                }     
+    // Plugin yükleme
+    console.log(chalk.blueBright.italic('⬇️ Installing external plugins...'));
+    var plugins = await plugindb.PluginDB.findAll();
+    for (const plugin of plugins) {
+        if (!fs.existsSync('./plugins/' + plugin.dataValues.name + '.js')) {
+            const response = await got(plugin.dataValues.url);
+            if (response.statusCode == 200) {
+                fs.writeFileSync('./plugins/' + plugin.dataValues.name + '.js', response.body);
+                require('./plugins/' + plugin.dataValues.name + '.js');
             }
-        });
+        }
+    }
 
-        console.log(
-            chalk.blueBright.italic('⬇️  Installing plugins...')
-        );
-
-        fs.readdirSync('./plugins').forEach(plugin => {
-            if(path.extname(plugin).toLowerCase() == '.js') {
-                require('./plugins/' + plugin);
-            }
-        });
-
-        console.log(
-            chalk.green.bold('✅ Plugins installed!')
-        );
+    fs.readdirSync('./plugins').forEach(plugin => {
+        if(path.extname(plugin).toLowerCase() == '.js') {
+            require('./plugins/' + plugin);
+        }
     });
-    
-    conn.on('message-new', async msg => {
-        if (msg.key && msg.key.remoteJid == 'status@broadcast') return;
+
+    console.log(chalk.green.bold('✅ Plugins installed!'));
+
+    // Mesaj eventleri
+    conn.ev.on('messages.upsert', async ({ messages }) => {
+        const msg = messages[0];
+        if (!msg.message || msg.key.remoteJid == 'status@broadcast') return;
 
         if (config.NO_ONLINE) {
-            await conn.updatePresence(msg.key.remoteJid, Presence.unavailable);
+            await conn.sendPresenceUpdate('unavailable', msg.key.remoteJid);
         }
 
-        if (msg.messageStubType === 32 || msg.messageStubType === 28) {
-            // Görüşürüz Mesajı
+        // Stub tipleri: goodbye / welcome
+        if ([32, 28].includes(msg.messageStubType)) {
             var gb = await getMessage(msg.key.remoteJid, 'goodbye');
-            if (gb !== false) {
-                await conn.sendMessage(msg.key.remoteJid, gb.message, MessageType.text);
-            }
+            if (gb) await conn.sendMessage(msg.key.remoteJid, gb.message, MessageType.text);
             return;
-        } else if (msg.messageStubType === 27 || msg.messageStubType === 31) {
-            // Hoşgeldin Mesajı
+        } else if ([27, 31].includes(msg.messageStubType)) {
             var gb = await getMessage(msg.key.remoteJid);
-            if (gb !== false) {
-                await conn.sendMessage(msg.key.remoteJid, gb.message, MessageType.text);
-            }
+            if (gb) await conn.sendMessage(msg.key.remoteJid, gb.message, MessageType.text);
             return;
         }
 
-        events.commands.map(
-            async (command) =>  {
-                if (msg.message && msg.message.imageMessage && msg.message.imageMessage.caption) {
-                    var text_msg = msg.message.imageMessage.caption;
-                } else if (msg.message && msg.message.videoMessage && msg.message.videoMessage.caption) {
-                    var text_msg = msg.message.videoMessage.caption;
-                } else if (msg.message) {
-                    var text_msg = msg.message.extendedTextMessage === null ? msg.message.conversation : msg.message.extendedTextMessage.text;
-                } else {
-                    var text_msg = undefined;
-                }
+        // Komutlar
+        events.commands.map(async (command) => {
+            let text_msg;
+            if (msg.message.imageMessage && msg.message.imageMessage.caption) text_msg = msg.message.imageMessage.caption;
+            else if (msg.message.videoMessage && msg.message.videoMessage.caption) text_msg = msg.message.videoMessage.caption;
+            else if (msg.message.extendedTextMessage) text_msg = msg.message.extendedTextMessage.text;
+            else if (msg.message.conversation) text_msg = msg.message.conversation;
 
-                if ((command.on !== undefined && (command.on === 'image' || command.on === 'photo')
-                    && msg.message && msg.message.imageMessage !== null && 
-                    (command.pattern === undefined || (command.pattern !== undefined && 
-                        command.pattern.test(text_msg)))) || 
-                    (command.pattern !== undefined && command.pattern.test(text_msg)) || 
-                    (command.on !== undefined && command.on === 'text' && text_msg) ||
-                    // Video
-                    (command.on !== undefined && (command.on === 'video')
-                    && msg.message && msg.message.videoMessage !== null && 
-                    (command.pattern === undefined || (command.pattern !== undefined && 
-                        command.pattern.test(text_msg))))) {
+            if (!text_msg) return;
 
-                    let sendMsg = false;
-                    var chat = conn.chats.get(msg.key.remoteJid)
-                        
-                    if ((config.SUDO !== false && msg.key.fromMe === false && command.fromMe === true &&
-                        (msg.participant && config.SUDO.includes(',') ? config.SUDO.split(',').includes(msg.participant.split('@')[0]) : msg.participant.split('@')[0] == config.SUDO || config.SUDO.includes(',') ? config.SUDO.split(',').includes(msg.key.remoteJid.split('@')[0]) : msg.key.remoteJid.split('@')[0] == config.SUDO)
-                    ) || command.fromMe === msg.key.fromMe || (command.fromMe === false && !msg.key.fromMe)) {
-                        if (command.onlyPinned && chat.pin === undefined) return;
-                        if (!command.onlyPm === chat.jid.includes('-')) sendMsg = true;
-                        else if (command.onlyGroup === chat.jid.includes('-')) sendMsg = true;
-                    }
-    
-                    if (sendMsg) {
-                        if (config.SEND_READ && command.on === undefined) {
-                            await conn.chatRead(msg.key.remoteJid);
-                        }
-                        
-                        var match = text_msg.match(command.pattern);
-                        
-                        if (command.on !== undefined && (command.on === 'image' || command.on === 'photo' )
-                        && msg.message.imageMessage !== null) {
-                            whats = new Image(conn, msg);
-                        } else if (command.on !== undefined && (command.on === 'video' )
-                        && msg.message.videoMessage !== null) {
-                            whats = new Video(conn, msg);
-                        } else {
-                            whats = new Message(conn, msg);
-                        }
+            if ((command.pattern && command.pattern.test(text_msg)) ||
+                (command.on && ((command.on === 'image' && msg.message.imageMessage) ||
+                               (command.on === 'video' && msg.message.videoMessage) ||
+                               (command.on === 'text' && text_msg)))) {
 
-                        if (command.deleteCommand && msg.key.fromMe) {
-                            await whats.delete(); 
-                        }
+                let sendMsg = false;
+                const chat = conn.chats?.get(msg.key.remoteJid);
 
-                        try {
-                            await command.function(whats, match);
-                        } catch (error) {
-                            if (config.LANG == 'TR' || config.LANG == 'AZ') {
-                                await conn.sendMessage(conn.user.jid, '*-- HATA RAPORU [WHATSASENA] --*' + 
-                                    '\n*WhatsAsena bir hata gerçekleşti!*'+
-                                    '\n_Bu hata logunda numaranız veya karşı bir tarafın numarası olabilir. Lütfen buna dikkat edin!_' +
-                                    '\n_Yardım için Telegram grubumuza yazabilirsiniz._' +
-                                    '\n_Bu mesaj sizin numaranıza (kaydedilen mesajlar) gitmiş olmalıdır._\n\n' +
-                                    '*Gerçekleşen Hata:* ```' + error + '```\n\n'
-                                    , MessageType.text);
-                            } else {
-                                await conn.sendMessage(conn.user.jid, '*-- ERROR REPORT [WHATSASENA] --*' + 
-                                    '\n*WhatsAsena an error has occurred!*'+
-                                    '\n_This error log may include your number or the number of an opponent. Please be careful with it!_' +
-                                    '\n_You can write to our Telegram group for help._' +
-                                    '\n_This message should have gone to your number (saved messages)._\n\n' +
-                                    '*Error:* ```' + error + '```\n\n'
-                                    , MessageType.text);
-                            }
-                        }
-                    }
+                if ((config.SUDO && !msg.key.fromMe && command.fromMe) &&
+                    (msg.participant ? config.SUDO.split(',').includes(msg.participant.split('@')[0]) : false)
+                ) sendMsg = true;
+                else if (command.fromMe === msg.key.fromMe || command.fromMe === false) sendMsg = true;
+
+                if (!sendMsg) return;
+
+                if (config.SEND_READ && !command.on) await conn.chatRead(msg.key.remoteJid);
+
+                let match = text_msg.match(command.pattern);
+                let whats;
+                if (command.on === 'image' && msg.message.imageMessage) whats = new Image(conn, msg);
+                else if (command.on === 'video' && msg.message.videoMessage) whats = new Video(conn, msg);
+                else whats = new Message(conn, msg);
+
+                if (command.deleteCommand && msg.key.fromMe) await whats.delete();
+
+                try {
+                    await command.function(whats, match);
+                } catch (error) {
+                    await conn.sendMessage(conn.user.id, `*-- ERROR REPORT [WHATSASENA] --*\n\`\`\`${error}\`\`\``, MessageType.text);
                 }
             }
-        )
+        });
     });
-
-    try {
-        await conn.connect();
-    } catch {
-        if (!nodb) {
-            console.log(chalk.red.bold('Eski sürüm stringiniz yenileniyor...'))
-            conn.loadAuthInfo(Session.deCrypt(config.SESSION)); 
-            try {
-                await conn.connect();
-            } catch {
-                return;
-            }
-        }
-    }
 }
 
 whatsAsena();
